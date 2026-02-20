@@ -3,13 +3,11 @@ import streamlit as st
 from io import BytesIO
 import calendar
 import re
+from typing import Optional, Dict, Any
 
 # ============================================================
 # Helpers
 # ============================================================
-# This section contains small utility functions used throughout the app.
-# The goal is to keep the main logic (grouping + output generation) clean
-# and easy to read.
 
 def pick_col(df, candidates):
     """
@@ -19,10 +17,6 @@ def pick_col(df, candidates):
     1) Exact match (case-insensitive)
     2) Substring match (case-insensitive)
     3) Regex match if candidate starts with '^'
-
-    Why this exists:
-    - Your raw files sometimes have slightly different column naming
-    - This makes the code more resilient without hard-coding one name
     """
     cols_lower = {c.lower(): c for c in df.columns}
 
@@ -60,18 +54,12 @@ def coerce_numeric(series):
     - Removes non-numeric characters (commas, currency symbols, etc.)
     - Fixes cases with too many decimal points
     - Converts to float, invalid -> NaN
-
-    Why:
-    - Your raw file often contains "30,000,000" or "Rp 30.000.000"
-    - pandas won't treat that as numeric without cleaning
     """
     if series is None:
         return None
 
     s = series.astype(str)
-    # Keep only digits, minus sign, dot
     s = s.str.replace(r"[^0-9\.-]", "", regex=True)
-    # If multiple '.' exist, remove extras (keep the last structure consistent)
     s = s.apply(lambda x: x if x.count('.') <= 1 else (x.replace('.', '', x.count('.') - 1)))
 
     out = pd.to_numeric(s, errors='coerce')
@@ -79,76 +67,98 @@ def coerce_numeric(series):
 
 
 # ============================================================
-# Allocation logic
+# Allocation logic (customizable)
 # ============================================================
-# This section determines the % allocation for each day of the month.
-# Output: DataFrame of day -> percent (fraction, sum ~ 1.0)
 
-def get_allocation(month: int, year: int) -> pd.DataFrame:
+def get_allocation(month: int, year: int, settings: Optional[Dict[str, Any]] = None) -> pd.DataFrame:
     """
     Create a daily allocation schedule as fractions that sum to ~1.0.
 
-    Rules in your current logic:
+    Default rules (current behavior):
     - Day 1..(DD-1): 4% each
     - DD (double date day, e.g., Oct => day 10): 18%
     - DD+1: 4.5%
     - 24th: 3%
     - 25th: 8%
-    - Remaining % split equally across:
+    - Remaining % split across:
         A) mid-month bucket: (DD+2)..23
         B) after payday bucket: 26..end
-        (50/50 split unless one bucket is empty)
+    With ratio mid=55%, after=45% by default.
 
-    Note:
-    - dd = month number (Feb => 2, Mar => 3, etc.)
-    - capped by month length for safety
+    settings keys (percent units unless noted):
+    - pct_day1_to_dd_minus1
+    - pct_dd
+    - pct_dd_plus1
+    - pct_24
+    - pct_25
+    - mid_bucket_share  (0..1 portion of remaining_pct; after = 1 - mid)
     """
+    default_settings = {
+        "pct_day1_to_dd_minus1": 4.0,
+        "pct_dd": 18.0,
+        "pct_dd_plus1": 4.5,
+        "pct_24": 3.0,
+        "pct_25": 8.0,           # default 8%
+        "mid_bucket_share": 0.55
+    }
+
+    if settings is None:
+        settings = {}
+    s = {**default_settings, **settings}
+
     days = calendar.monthrange(year, month)[1]
     dd = min(month, days)
 
-    # alloc_map[d] = percent for day d (in percent units, e.g. 4.0 means 4%)
     alloc_map = {d: None for d in range(1, days + 1)}
 
     # 1) Day 1..(DD-1)
     for d in range(1, dd):
-        alloc_map[d] = 4.0
+        alloc_map[d] = float(s["pct_day1_to_dd_minus1"])
 
     # 2) DD
-    alloc_map[dd] = 18.0
+    alloc_map[dd] = float(s["pct_dd"])
 
     # 3) DD+1
     if dd + 1 <= days:
-        alloc_map[dd + 1] = 4.5
+        alloc_map[dd + 1] = float(s["pct_dd_plus1"])
 
     # 4) 24th
     if 24 <= days:
-        alloc_map[24] = 3.0
+        alloc_map[24] = float(s["pct_24"])
 
     # 5) 25th
     if 25 <= days:
-        alloc_map[25] = 8.0
+        alloc_map[25] = float(s["pct_25"])
 
     # 6) Fill remaining days so total becomes 100%
     total_assigned = sum(v for v in alloc_map.values() if v is not None)
     remaining_days = [d for d, v in alloc_map.items() if v is None]
 
-    # Bucket definitions
     mid_days = [d for d in remaining_days if (dd + 2) <= d <= 23]
     after_days = [d for d in remaining_days if d >= 26]
 
     if remaining_days:
         remaining_pct = 100.0 - total_assigned
 
-        # Avoid division by zero
+        # If specials exceed 100%, impossible allocation (negative remaining)
+        if remaining_pct < -1e-9:
+            st.error(
+                f"Allocation invalid: special-day total is {total_assigned:.2f}% (> 100%). "
+                "Reduce special day percentages."
+            )
+            return pd.DataFrame()
+
+        # If one bucket is empty, dump all remaining into the other
         if len(mid_days) == 0 and len(after_days) > 0:
             mid_share, after_share = 0.0, remaining_pct
         elif len(after_days) == 0 and len(mid_days) > 0:
             mid_share, after_share = remaining_pct, 0.0
         else:
-            mid_share = remaining_pct * 0.55
-            after_share = remaining_pct * 0.45
+            mid_ratio = float(s["mid_bucket_share"])
+            mid_ratio = max(0.0, min(1.0, mid_ratio))  # clamp 0..1
+            mid_share = remaining_pct * mid_ratio
+            after_share = remaining_pct * (1.0 - mid_ratio)
 
-        # Spread within each bucket evenly
         if len(mid_days) > 0:
             per_mid = mid_share / len(mid_days)
             for d in mid_days:
@@ -159,7 +169,7 @@ def get_allocation(month: int, year: int) -> pd.DataFrame:
             for d in after_days:
                 alloc_map[d] = per_after
 
-        # Fix float rounding residue by dumping it into the last bucket day
+        # Fix rounding residue by dumping into the last bucket day
         used = sum(v for v in alloc_map.values() if v is not None)
         leftover = 100.0 - used
         if abs(leftover) > 1e-9:
@@ -167,15 +177,17 @@ def get_allocation(month: int, year: int) -> pd.DataFrame:
                 alloc_map[after_days[-1]] += leftover
             elif len(mid_days) > 0:
                 alloc_map[mid_days[-1]] += leftover
+            else:
+                alloc_map[dd] += leftover
 
-    # Convert % to fraction (0.04 instead of 4.0)
-    percent_list = [alloc_map[d] / 100.0 for d in range(1, days + 1)]
-    df = pd.DataFrame({"day": range(1, days + 1), "percent": percent_list})
+    df = pd.DataFrame({
+        "day": range(1, days + 1),
+        "percent": [alloc_map[d] / 100.0 for d in range(1, days + 1)]
+    })
 
-    # Safety warning if sum is off due to rounding
-    s = df["percent"].sum()
-    if not (0.999 <= s <= 1.001):
-        st.warning(f"Daily allocation sums to {s*100:.2f}% (expected ~100%).")
+    total_frac = df["percent"].sum()
+    if not (0.999 <= total_frac <= 1.001):
+        st.warning(f"Daily allocation sums to {total_frac*100:.2f}% (expected ~100%).")
 
     return df
 
@@ -183,9 +195,6 @@ def get_allocation(month: int, year: int) -> pd.DataFrame:
 # ============================================================
 # ROAS target + benchmark helpers
 # ============================================================
-# These functions take ROAS KPI values and compute:
-#   - Target ROAS: KPI with buffer logic
-#   - Benchmark label: e.g. "5-7"
 
 def buffered_target_roas(roas_kpi):
     """
@@ -201,7 +210,7 @@ def buffered_target_roas(roas_kpi):
         return None
     try:
         roas_kpi = float(roas_kpi)
-    except:
+    except Exception:
         return None
 
     if roas_kpi <= 3:
@@ -222,9 +231,7 @@ def compute_roas_benchmark(roas_kpi):
     - KPI missing -> ''
     - KPI = 1 -> "1"
     - KPI = 3 -> "2-3"
-    - else -> "{KPI-2}-{KPI}" rounded
-
-    Output is string because you want it displayed as label like "5-7".
+    - else -> "{max(KPI-2, 0)}-{KPI}" rounded (never negative)
     """
     if roas_kpi is None or (isinstance(roas_kpi, float) and pd.isna(roas_kpi)):
         return ''
@@ -238,33 +245,38 @@ def compute_roas_benchmark(roas_kpi):
     if abs(rk - 3) < 1e-9:
         return "2-3"
 
-    return f"{round(rk - 2)}-{round(rk)}"
+    low = max(0, round(rk - 2))
+    high = max(0, round(rk))
+    # If KPI is very small, low==high, keep it clean
+    if low == high:
+        return f"{high}"
+    return f"{low}-{high}"
 
 
 # ============================================================
 # Core transformation (raw monthly plan -> daily allocation output)
 # ============================================================
 
-def create_daily_allocation(df_raw, month, year, include_objective: bool):
+def create_daily_allocation(
+    df_raw: pd.DataFrame,
+    month: int,
+    year: int,
+    include_objective: bool,
+    alloc_settings: Optional[Dict[str, Any]] = None
+) -> pd.DataFrame:
     """
     Main function to transform raw monthly budget plan into daily budgets.
 
-    Inputs:
-    - df_raw: raw Excel sheet loaded into DataFrame
-    - month/year: chosen from UI (controls daily allocation dates)
-    - include_objective:
-        If True: output includes Objective column AND grouping includes Objective,
-                EXCEPT for aggregate rows of BOS/NOS/Dancow where Objective is forced blank.
-
     Output:
     DataFrame with daily rows:
-        Date, Retailer, Store, Brand, (Objective optional), Daily Budget, Target ROAS, ROAS KPI, ROAS Benchmark
+        Date, Retailer, Store, Brand, (Objective optional),
+        Daily Budget, Target ROAS, ROAS KPI, ROAS Benchmark
     """
-    allocation = get_allocation(month, year)
+    allocation = get_allocation(month, year, settings=alloc_settings)
+    if allocation.empty:
+        return pd.DataFrame()
 
-    # ----------------------------
     # 1) Identify columns from raw file
-    # ----------------------------
     col_budget = pick_col(df_raw, ['Media Budget Plan', 'Budget', 'media_budget', 'media budget', '^.*budget.*$'])
     col_roas_plan = pick_col(df_raw, ['ROAS Plan', '^roas plan$', 'roas'])
     col_store = pick_col(df_raw, ['Store'])
@@ -272,82 +284,54 @@ def create_daily_allocation(df_raw, month, year, include_objective: bool):
     col_retailer = pick_col(df_raw, ['Retailer', 'Platform'])
     col_objective = pick_col(df_raw, ['Objective', 'Obj', '^.*objective.*$'])
 
-    # Hard requirements: need budget + store to proceed
+    # Hard requirements: need budget + store
     if not all([col_budget, col_store]):
         st.error("Couldn't find required columns: Budget and Store.")
         return pd.DataFrame()
 
-    # If user wants Objective but we can't find it, disable it cleanly
+    # If user wants Objective but we can't find it
     if include_objective and not col_objective:
         st.warning("Objective toggle is ON, but no Objective column was found. Output will omit Objective.")
         include_objective = False
 
-    # ----------------------------
     # 2) Clean numeric fields + remove zero budgets
-    # ----------------------------
     df_raw[col_budget] = coerce_numeric(df_raw[col_budget])
     if col_roas_plan:
         df_raw[col_roas_plan] = coerce_numeric(df_raw[col_roas_plan])
 
-    # Keep only rows with positive budget
     df_raw = df_raw[df_raw[col_budget].fillna(0) > 0]
     if df_raw.empty:
         st.warning("No rows with positive budget after cleaning.")
         return pd.DataFrame()
 
-    # ----------------------------
-    # 3) Decide which stores should keep sub-brand breakdown
-    # ----------------------------
-    # Only these stores will have Brand kept in grouping/output.
-    # All other stores will have Brand output as blank.
+    # 3) Decide which stores keep sub-brand breakdown
     stores_with_subbrands = ['dancow', 'nos', 'bos']
-
-    # True for rows whose Store is in the list above
     subbrand_mask = df_raw[col_store].astype(str).str.strip().str.lower().isin(stores_with_subbrands)
 
-    # group_brand becomes a helper column used for grouping
-    # - for Dancow/NOS/BOS: keep Brand
-    # - for other stores: set '' so they don't split by brand
     group_brand = pd.Series('', index=df_raw.index, dtype='object')
     if col_brand:
         group_brand[subbrand_mask] = df_raw.loc[subbrand_mask, col_brand].astype(str).fillna('')
 
-    # Retailer is taken from "Platform" (or "Retailer" if present)
     retailer_series = df_raw[col_retailer] if col_retailer else pd.Series('Retailer', index=df_raw.index)
 
-    # Objective series only needed if toggle is ON
     if include_objective:
         objective_series = df_raw[col_objective].astype(str).fillna('') if col_objective else pd.Series('', index=df_raw.index)
 
-    # ----------------------------
     # 4) Group raw data to monthly totals
-    # ----------------------------
-    # We group to get one monthly budget per unique combination.
-    # If include_objective=True, objective is part of the group *for normal rows*.
     agg_dict = {col_budget: 'sum'}
     if col_roas_plan:
         agg_dict[col_roas_plan] = 'median'
 
     tmp = df_raw.assign(__group_brand=group_brand, __retailer=retailer_series)
 
-    # group keys always include retailer + store + brand-group
     group_keys = ['__retailer', col_store, '__group_brand']
-
-    # optionally include objective as a grouping key
     if include_objective:
         tmp = tmp.assign(__objective=objective_series)
         group_keys.append('__objective')
 
     grouped = tmp.groupby(group_keys, dropna=False).agg(agg_dict).reset_index()
 
-    # ----------------------------
     # 5) Add aggregate store rows for Dancow/NOS/BOS
-    # ----------------------------
-    # Requirement:
-    #   For Dancow/NOS/BOS, add an "aggregate row" with blank Brand that sums across:
-    #     - all sub-brands
-    #     - all objectives (Retention/Recruitment/etc.)
-    #   and if Objective toggle is ON, the aggregate row Objective must be BLANK.
     mask_multi = grouped[col_store].astype(str).str.strip().str.lower().isin(stores_with_subbrands)
 
     if mask_multi.any():
@@ -355,29 +339,21 @@ def create_daily_allocation(df_raw, month, year, include_objective: bool):
         if col_roas_plan:
             agg_store_dict[col_roas_plan] = 'median'
 
-        # Key point: we aggregate across ALL objectives, so objective is NOT in keys
+        # Aggregate across ALL objectives => objective NOT in keys
         agg_group_keys = ['__retailer', col_store]
-
         agg_store = grouped.loc[mask_multi].groupby(agg_group_keys, as_index=False).agg(agg_store_dict)
 
-        # Make it an aggregate row: blank brand
-        agg_store['__group_brand'] = ''
-
-        # If objective is included, force blank objective for aggregate rows
+        agg_store['__group_brand'] = ''  # blank brand for aggregate row
         if include_objective:
-            agg_store['__objective'] = ''
+            agg_store['__objective'] = ''  # force blank objective for aggregate row
 
         # Remove any existing blank-brand rows (avoid duplicates)
-        # If include_objective=True, there might be multiple blank-brand rows per objective, remove them all.
         to_remove = mask_multi & (grouped['__group_brand'].astype(str).str.strip() == '')
         grouped = grouped.loc[~to_remove]
 
-        # Append aggregate rows back
         grouped = pd.concat([grouped, agg_store], ignore_index=True)
 
-    # ----------------------------
-    # 6) Expand each monthly row into daily rows based on allocation
-    # ----------------------------
+    # 6) Expand each monthly row into daily rows
     rows = []
 
     for _, g in grouped.iterrows():
@@ -385,24 +361,15 @@ def create_daily_allocation(df_raw, month, year, include_objective: bool):
         store = g[col_store]
         store_l = str(store).strip().lower()
 
-        # Output Brand rules:
-        # - For Dancow/NOS/BOS: show brand (sub-brand or blank if aggregate)
-        # - For other stores: always blank
         brand_out = g['__group_brand'] if store_l in stores_with_subbrands else ''
 
-        # Objective output:
-        # - Only when toggle ON
-        # - For aggregate rows, it will already be forced to '' above
         objective_out = ''
         if include_objective:
             objective_out = g.get('__objective', '')
 
         monthly_budget = float(g[col_budget]) if pd.notna(g[col_budget]) else 0.0
-
-        # ROAS KPI from data (if present)
         roas_kpi_val = float(g[col_roas_plan]) if (col_roas_plan and pd.notna(g[col_roas_plan])) else None
 
-        # Detect aggregate row: blank brand
         is_blank_brand = (not g['__group_brand']) or (str(g['__group_brand']).strip() == '')
 
         # Special fixed rules for NOS and Dancow aggregate rows only
@@ -413,12 +380,10 @@ def create_daily_allocation(df_raw, month, year, include_objective: bool):
             roas_kpi_val = 15
             target_roas_val = 24
         else:
-            # Default: compute target from KPI using buffer logic
             target_roas_val = buffered_target_roas(roas_kpi_val)
 
         benchmark_val = compute_roas_benchmark(roas_kpi_val)
 
-        # Expand to daily
         for _, a in allocation.iterrows():
             date = pd.Timestamp(year=year, month=month, day=int(a['day']))
             daily_budget = round(monthly_budget * float(a['percent']))
@@ -427,11 +392,11 @@ def create_daily_allocation(df_raw, month, year, include_objective: bool):
                 'Date': date.strftime('%Y-%m-%d'),
                 'Retailer': retailer,
                 'Store': store,
+                'Brand': brand_out,
                 'Daily Budget': daily_budget,
                 'Target ROAS': target_roas_val,
                 'ROAS KPI': roas_kpi_val,
                 'ROAS Benchmark': benchmark_val if benchmark_val is not None else '',
-                'Brand': brand_out
             }
 
             if include_objective:
@@ -440,70 +405,163 @@ def create_daily_allocation(df_raw, month, year, include_objective: bool):
             rows.append(row)
 
     out = pd.DataFrame(rows)
-
-    # Optional: reorder columns so Objective appears next to Brand
-    if include_objective and 'Objective' in out.columns:
-        cols = [
-            'Date', 'Retailer', 'Store', 'Brand', 'Objective',
-            'Daily Budget', 'Target ROAS', 'ROAS KPI', 'ROAS Benchmark'
-        ]
-        out = out[[c for c in cols if c in out.columns]]
-
     return out
 
 
 # ============================================================
 # Streamlit UI
 # ============================================================
-# This section is the app interface:
-#  - upload file
-#  - choose month/year
-#  - toggle objective
-#  - generate output
-#  - preview + download excel
 
 st.set_page_config(page_title='Daily Allocation Budget Maker', layout='wide')
 st.title('📊 Daily Allocation Budget Maker')
 
 file = st.file_uploader('Upload the Budget Plan Excel file', type=['xlsx'])
 
-# Put controls in columns so it looks neat
+# Controls
 col1, col2 = st.columns([1, 1])
 with col1:
     month = st.selectbox('Select Month', list(range(1, 13)), index=pd.Timestamp.now().month - 1)
 with col2:
     year = st.number_input('Select Year', min_value=2020, max_value=2100, value=pd.Timestamp.now().year, step=1)
-    
+
 include_objective = st.toggle('Include Objective in output', value=False)
 
+# Advanced allocation settings (override)
+advanced_alloc = st.toggle("Advanced allocation settings", value=False)
+
+alloc_settings: Dict[str, Any] = {}  # empty => defaults in get_allocation()
+
+if advanced_alloc:
+    st.subheader("Allocation Overrides")
+
+    c1, c2, c3 = st.columns(3)
+    with c1:
+        pct_day1_to_dd_minus1 = st.number_input(
+            "Day 1..(DD-1) % each", min_value=0.0, max_value=100.0, value=4.0, step=0.5
+        )
+        pct_dd = st.number_input(
+            "DD %", min_value=0.0, max_value=100.0, value=18.0, step=0.5
+        )
+        pct_dd_plus1 = st.number_input(
+            "DD+1 %", min_value=0.0, max_value=100.0, value=4.5, step=0.5
+        )
+
+    with c2:
+        pct_24 = st.number_input(
+            "24th %", min_value=0.0, max_value=100.0, value=3.0, step=0.5
+        )
+        pct_25 = st.number_input(
+            "25th %", min_value=0.0, max_value=100.0, value=8.0, step=0.5
+        )
+
+    with c3:
+        mid_bucket_share = st.slider(
+            "Mid-month share of remaining (DD+2..23)", min_value=0, max_value=100, value=55, step=1
+        )
+        st.caption(f"After-payday share (26..end) will be {100 - mid_bucket_share}%")
+
+    alloc_settings = {
+        "pct_day1_to_dd_minus1": float(pct_day1_to_dd_minus1),
+        "pct_dd": float(pct_dd),
+        "pct_dd_plus1": float(pct_dd_plus1),
+        "pct_24": float(pct_24),
+        "pct_25": float(pct_25),
+        "mid_bucket_share": float(mid_bucket_share) / 100.0,
+    }
+
+    # ---- Explain what overrides are doing (sum specials, remaining, bucket days) ----
+    days_in_month = calendar.monthrange(int(year), int(month))[1]
+    dd_day = min(int(month), days_in_month)
+
+    # Count bucket days (based on the exact same logic as get_allocation)
+    remaining_days = [d for d in range(1, days_in_month + 1)]
+    # Mark special days as "assigned": day 1..dd-1, dd, dd+1, 24, 25
+    assigned = set(range(1, dd_day))  # 1..dd-1
+    assigned.add(dd_day)
+    if dd_day + 1 <= days_in_month:
+        assigned.add(dd_day + 1)
+    if 24 <= days_in_month:
+        assigned.add(24)
+    if 25 <= days_in_month:
+        assigned.add(25)
+
+    remaining_days = [d for d in remaining_days if d not in assigned]
+    mid_days = [d for d in remaining_days if (dd_day + 2) <= d <= 23]
+    after_days = [d for d in remaining_days if d >= 26]
+
+    # Sum specials exactly like they contribute (per-day * count + fixed days)
+    special_total = (
+        max(dd_day - 1, 0) * alloc_settings["pct_day1_to_dd_minus1"]
+        + alloc_settings["pct_dd"]
+        + (alloc_settings["pct_dd_plus1"] if (dd_day + 1) <= days_in_month else 0.0)
+        + (alloc_settings["pct_24"] if 24 <= days_in_month else 0.0)
+        + (alloc_settings["pct_25"] if 25 <= days_in_month else 0.0)
+    )
+    remaining_pct = 100.0 - special_total
+
+    # How remaining will split (consider bucket empties)
+    if remaining_pct < 0:
+        mid_share_pct = 0.0
+        after_share_pct = 0.0
+    else:
+        if len(mid_days) == 0 and len(after_days) > 0:
+            mid_share_pct, after_share_pct = 0.0, remaining_pct
+        elif len(after_days) == 0 and len(mid_days) > 0:
+            mid_share_pct, after_share_pct = remaining_pct, 0.0
+        elif len(mid_days) == 0 and len(after_days) == 0:
+            mid_share_pct, after_share_pct = 0.0, 0.0
+        else:
+            mid_ratio = alloc_settings["mid_bucket_share"]
+            mid_share_pct = remaining_pct * mid_ratio
+            after_share_pct = remaining_pct * (1.0 - mid_ratio)
+
+    st.markdown("### Allocation Summary (based on your overrides)")
+    s1, s2, s3, s4 = st.columns(4)
+    with s1:
+        st.metric("Special days total", f"{special_total:.2f}%")
+    with s2:
+        st.metric("Remaining to distribute", f"{remaining_pct:.2f}%")
+    with s3:
+        st.metric("Mid bucket days (DD+2..23)", f"{len(mid_days)} day(s)")
+    with s4:
+        st.metric("After bucket days (26..end)", f"{len(after_days)} day(s)")
+
+    st.caption(
+        f"Remaining split: mid ≈ **{mid_share_pct:.2f}%** across **{len(mid_days)}** day(s), "
+        f"after ≈ **{after_share_pct:.2f}%** across **{len(after_days)}** day(s)."
+    )
+
+    if special_total > 100.0:
+        st.error("Special days total exceeds 100%. Reduce some special day percentages.")
+
+
 if file:
-    # Read Excel
     try:
         df_raw = pd.read_excel(file)
     except Exception as e:
         st.error(f"Failed to read Excel: {e}")
         st.stop()
 
-    # Inform user which allocation pattern we are using
-    days = calendar.monthrange(year, month)[1]
+    days = calendar.monthrange(int(year), int(month))[1]
     st.caption(f'Using **{days}-day and month-{month}** allocation pattern (month-aware). 🐔')
 
-    # Run transform
-    df_out = create_daily_allocation(df_raw, month, year, include_objective=include_objective)
+    df_out = create_daily_allocation(
+        df_raw,
+        int(month),
+        int(year),
+        include_objective=include_objective,
+        alloc_settings=alloc_settings if advanced_alloc else None
+    )
 
-    # If nothing produced, tell user
     if df_out.empty:
         st.info('No output produced. Please check your input columns and budgets.')
     else:
-        # Preview first/last 50 rows to validate output quickly
         df_out_preview = pd.concat([df_out.head(50), df_out.tail(50)])
 
-        # Save to in-memory Excel so user can download
         buffer = BytesIO()
         with pd.ExcelWriter(buffer, engine='xlsxwriter') as writer:
             df_out.to_excel(writer, index=False, sheet_name='Output')
 
-        # Styling only for the download button (optional UI polish)
         st.markdown(
             '''<style>
             div[data-testid="stDownloadButton"] button{
@@ -520,15 +578,13 @@ if file:
             unsafe_allow_html=True
         )
 
-        # Download output Excel
         st.download_button(
             '🐤 Download Excel',
             data=buffer.getvalue(),
-            file_name=f'daily_allocation_{year}-{month:02d}.xlsx',
+            file_name=f'daily_allocation_{int(year)}-{int(month):02d}.xlsx',
             mime='application/vnd.openxmlformats-officedocument.spreadsheetml.sheet',
             type='secondary'
         )
 
-        # Display preview table in Streamlit
         st.subheader('Preview')
         st.dataframe(df_out_preview, use_container_width=True)
