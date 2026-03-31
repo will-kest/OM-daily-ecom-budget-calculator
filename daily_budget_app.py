@@ -392,11 +392,11 @@ def create_daily_allocation(
                 'Date': date.strftime('%Y-%m-%d'),
                 'Retailer': retailer,
                 'Store': store,
-                'Brand': brand_out,
                 'Daily Budget': daily_budget,
                 'Target ROAS': target_roas_val,
                 'ROAS KPI': roas_kpi_val,
                 'ROAS Benchmark': benchmark_val if benchmark_val is not None else '',
+                'Brand': brand_out,
             }
 
             if include_objective:
