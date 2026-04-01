@@ -58,12 +58,17 @@ def coerce_numeric(series):
     if series is None:
         return None
 
-    s = series.astype(str)
-    s = s.str.replace(r"[^0-9\.-]", "", regex=True)
-    s = s.apply(lambda x: x if x.count('.') <= 1 else (x.replace('.', '', x.count('.') - 1)))
+    def clean_value(x):
+        if pd.isna(x):
+            return ''
+        x = str(x)
+        x = re.sub(r"[^0-9\.-]", "", x)
+        if x.count('.') > 1:
+            x = x.replace('.', '', x.count('.') - 1)
+        return x
 
-    out = pd.to_numeric(s, errors='coerce')
-    return out
+    s = series.apply(clean_value)
+    return pd.to_numeric(s, errors='coerce')
 
 
 # ============================================================
